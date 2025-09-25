@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+Single-process CoT data generation script
+Generates Chain-of-Thought reasoning data for training
+"""
+
+import jsonlines
+import json
+import argparse
+import os
+import torch
+import transformers
+from typing import List, Dict, Optional
+import time
+from tqdm import tqdm
+from generators.instruction import *
+from envs import math_reasoning_get_feedback, programming_get_feedback, olympiad_get_feedback
+import warnings
+import logging
+
+# Suppress warnings and unnecessary output
+logging.getLogger("transformers").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore")
+transformers.logging.set_verbosity_error()
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_checkpoint", type=str, default="Qwen/Qwen3-4B-Instruct-2507",
+        help="Model checkpoint for generating CoT data"
+    )
+    parser.add_argument(
+        "--task", type=str, choices=["math_reasoning", "programming", "olympiad"],
+        help="Task type"
+    )
+    parser.add_argument(
+        "--input-file", type=str, default="benchmark/math/train.jsonl",
+        help="Input file, `.jsonl` format"
+    )
+    parser.add_argument(
+        "--output-file", type=str, default="datasets_cot/cot_dataset.jsonl",
+        help="Output file, `.jsonl` format"
+    )
+    parser.add_argument(
+        "--max_samples", type=int, default=1000,
+        help="Maximum number of samples to process"
+    )
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=30720,
+        help="Maximum new tokens for generation"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.0,
+        help="Generation temperature (0.0 for greedy decoding)"
+    )
+    parser.add_argument(
+        "--top_p", type=float, default=1.0,
+        help="Top-p sampling parameter (1.0 for greedy decoding)"
+    )
+    parser.add_argument(
+        "--gpu_id", type=str, default="0",
+        help="GPU device ID to use"
+    )
+
+    return parser.parse_args()
+
+def load_model_and_tokenizer(model_checkpoint: str, gpu_id: str):
+    """Load model and tokenizer for CoT generation"""
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+
+    print(f"Loading model: {model_checkpoint}")
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_checkpoint,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    )
+
+    print("Loading tokenizer...")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
+        model_checkpoint,
+        trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model.eval()
+    return model, tokenizer
+
+def generate_cot_thinking(model, tokenizer, question: str, task: str, args) -> str:
+    """Generate Chain-of-Thought reasoning for a question"""
+
+    # Select appropriate CoT instruction based on task
+    if task == "math_reasoning":
+        instruction = MATH_COT_INSTRUCTION
+    elif task == "programming":
+        instruction = PY_COT_INSTRUCTION
+    elif task == "olympiad":
+        instruction = OLYMPIAD_COT_INSTRUCTION
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+
+    # Create prompt
+    prompt = f"{instruction}\n\nProblem: {question}\n\nReasoning:"
+
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    # Generate
+    try:
+        with torch.no_grad():
+            # Use greedy decoding when temperature is 0.0
+            if args.temperature == 0.0:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    do_sample=False,  # Greedy decoding
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            else:
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    do_sample=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+        # Decode response
+        response = tokenizer.decode(
+            outputs[0][inputs['input_ids'].shape[1]:],
+            skip_special_tokens=True
+        ).strip()
+
+        return response
+
+    except Exception as e:
+        print(f"Generation error: {e}")
+        return ""
+
+def get_task_instruction(task: str) -> str:
+    """Get the appropriate simple instruction for the task"""
+    if task == "math_reasoning":
+        return MATH_SIMPLE_ACTION_INSTRUCTION
+    elif task == "programming":
+        return PY_SIMPLE_ACTION_INSTRUCTION
+    elif task == "olympiad":
+        return OLYMPIAD_SIMPLE_ACTION_INSTRUCTION
+    else:
+        raise ValueError(f"Unsupported task: {task}")
+
+def validate_cot_data(cot_thinking: str, question: str, answer: str, task: str) -> bool:
+    """Simple validation of CoT data quality"""
+    if not cot_thinking or len(cot_thinking.strip()) < 10:
+        return False
+
+    # Basic checks for reasoning content
+    if task in ["math_reasoning", "olympiad"]:
+        # Should contain some mathematical reasoning keywords
+        math_keywords = ["calculate", "solve", "equation", "formula", "therefore", "because", "since"]
+        if not any(keyword in cot_thinking.lower() for keyword in math_keywords):
+            return False
+
+    elif task == "programming":
+        # Should contain some programming reasoning keywords
+        prog_keywords = ["function", "algorithm", "implementation", "code", "return", "variable"]
+        if not any(keyword in cot_thinking.lower() for keyword in prog_keywords):
+            return False
+
+    return True
+
+def main():
+    args = get_args()
+
+    # Load model and tokenizer
+    model, tokenizer = load_model_and_tokenizer(args.model_checkpoint, args.gpu_id)
+
+    # Load input data
+    print(f"Loading data from: {args.input_file}")
+    data = []
+    with open(args.input_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            data.append(json.loads(line.strip()))
+
+    # Limit samples if specified
+    if args.max_samples > 0:
+        data = data[:args.max_samples]
+
+    print(f"Processing {len(data)} samples")
+
+    # Create output directory if needed
+    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+
+    # Process data
+    successful_generations = 0
+
+    with open(args.output_file, 'w', encoding='utf-8') as f_out:
+        for i, item in enumerate(tqdm(data, desc="Generating CoT data")):
+            question = item.get('question') or item.get('problem', '')
+            answer = item.get('answer', '')
+
+            if not question:
+                print(f"Warning: Empty question in item {i}")
+                continue
+
+            # Generate CoT thinking
+            cot_thinking = generate_cot_thinking(model, tokenizer, question, args.task, args)
+
+            # Validate generated CoT
+            if not validate_cot_data(cot_thinking, question, answer, args.task):
+                print(f"Warning: Invalid CoT generated for item {i}")
+                continue
+
+            # Create training sample
+            training_sample = {
+                'question': question,
+                'thinking': cot_thinking,
+                'answer': answer,
+                'instruction': get_task_instruction(args.task),
+                'task': args.task,
+                'original_index': i
+            }
+
+            # Save to output
+            f_out.write(json.dumps(training_sample, ensure_ascii=False) + '\n')
+            f_out.flush()
+
+            successful_generations += 1
+
+    # Print statistics
+    print(f"\n=== CoT Data Generation Complete ===")
+    print(f"Total input samples: {len(data)}")
+    print(f"Successful generations: {successful_generations}")
+    print(f"Success rate: {successful_generations/len(data)*100:.2f}%")
+    print(f"Output saved to: {args.output_file}")
+
+if __name__ == "__main__":
+    main()

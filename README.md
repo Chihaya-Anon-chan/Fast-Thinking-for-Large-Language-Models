@@ -1,5 +1,6 @@
-# Fast-Thinking-for-Large-Language-Models
-Official implementation of 'Fast Thinking for Large Language Models'.
+# FastThink
+
+FastThink implements codebook-based adapter models for fast mathematical reasoning.
 
 ## Setup
 

@@ -1,0 +1,129 @@
+{
+  "description": "Learning rate multipliers for different model components",
+  "usage": "Each component's actual learning rate = base_lr * multiplier",
+  "default_multiplier": 1.0,
+  
+  "stage1_multipliers": {
+    "description": "Multipliers for Stage 1 (Codebook alignment training)",
+    "base_lr_param": "lr1",
+    
+    "components": {
+      "codebook": {
+        "multiplier": 1.0,
+        "description": "Main codebook embeddings",
+        "patterns": ["codebook", "!learnable_queries"]
+      },
+      
+      "learnable_queries": {
+        "multiplier": 2.0,
+        "description": "Learnable query vectors - need higher LR for faster convergence",
+        "patterns": ["learnable_queries"]
+      },
+      
+      "question_attention": {
+        "multiplier": 1.5,
+        "description": "Question-query cross attention",
+        "patterns": ["question_attention"]
+      },
+      
+      "question_semantic_extractor": {
+        "multiplier": 1.2,
+        "description": "Semantic extraction layers",
+        "patterns": ["question_semantic_extractor"]
+      },
+      
+      "codebook_attention": {
+        "multiplier": 1.0,
+        "description": "Codebook cross attention",
+        "patterns": ["codebook_attention"]
+      },
+      
+      "thinking_refiner": {
+        "multiplier": 1.0,
+        "description": "Refiner layers - normal LR to ensure proper learning",
+        "patterns": ["thinking_refiner", "refiner"]
+      },
+
+      "thinking_norm": {
+        "multiplier": 0.8,
+        "description": "Normalization layers",
+        "patterns": ["thinking_norm"]
+      }
+    }
+  },
+  
+  "stage2_multipliers": {
+    "description": "Multipliers for Stage 2 (Fine-tuning with LoRA)",
+    "base_lr_param": "lr2",
+    
+    "components": {
+      "lora_early_layers": {
+        "multiplier": 0.5,
+        "description": "LoRA in early layers (before insertion point)",
+        "patterns": ["lora_", "layers.0.", "layers.1.", "layers.2.", "layers.3.", "layers.4."],
+        "conditional": "layer_num < inserted_layer - 5"
+      },
+      
+      "lora_middle_layers": {
+        "multiplier": 1.0,
+        "description": "LoRA in middle layers (around insertion point)",
+        "patterns": ["lora_"],
+        "conditional": "inserted_layer - 5 <= layer_num <= inserted_layer + 5"
+      },
+      
+      "lora_late_layers": {
+        "multiplier": 1.5,
+        "description": "LoRA in late layers (after insertion point) - more important for task adaptation",
+        "patterns": ["lora_"],
+        "conditional": "layer_num > inserted_layer + 5"
+      },
+      
+      "codebook": {
+        "multiplier": 0.3,
+        "description": "Codebook fine-tuning - gentle updates",
+        "patterns": ["codebook", "!learnable_queries"]
+      },
+      
+      "learnable_queries": {
+        "multiplier": 0.5,
+        "description": "Query fine-tuning",
+        "patterns": ["learnable_queries"]
+      },
+      
+      "thinking_refiner": {
+        "multiplier": 0.1,
+        "description": "Refiner fine-tuning - extremely conservative (reduced from 0.2)",
+        "patterns": ["thinking_refiner", "refiner"]
+      }
+    }
+  },
+  
+  "optimization_tips": {
+    "high_multipliers": "Components with multipliers > 1.0 learn faster, good for under-trained parts",
+    "low_multipliers": "Components with multipliers < 1.0 learn slower, good for stability",
+    "adjustment_guide": [
+      "If codebook diversity is low: increase codebook multiplier to 1.5-2.0",
+      "If queries not changing: increase learnable_queries multiplier to 3.0",
+      "If refiner unstable: decrease thinking_refiner multiplier to 0.3",
+      "If LoRA changes too small: increase lora multipliers by 50%"
+    ]
+  },
+  
+  "experimental_presets": {
+    "aggressive": {
+      "description": "Fast learning, may be unstable",
+      "stage1_scale": 1.5,
+      "stage2_scale": 1.5
+    },
+    "conservative": {
+      "description": "Slow but stable learning",
+      "stage1_scale": 0.7,
+      "stage2_scale": 0.7
+    },
+    "balanced": {
+      "description": "Default balanced approach",
+      "stage1_scale": 1.0,
+      "stage2_scale": 1.0
+    }
+  }
+}
